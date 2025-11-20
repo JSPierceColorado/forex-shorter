@@ -550,6 +550,18 @@ def run_bot_once():
                         order_status = "SKIPPED_BAD_PRICE"
                     else:
                         units_mag = int(round(notional_per_trade / rounded_price))
+
+                        # ---- 1-unit fallback ----
+                        if units_mag <= 0 and notional_per_trade > 0:
+                            logger.info(
+                                "Computed units < 1 for %s (notional=%.4f, price=%.8f); "
+                                "using minimum 1 unit instead.",
+                                pair,
+                                notional_per_trade,
+                                rounded_price,
+                            )
+                            units_mag = 1
+
                         if units_mag <= 0:
                             logger.warning(
                                 "Computed units <= 0 for %s (notional=%.4f, price=%.8f); skipping",
