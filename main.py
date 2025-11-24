@@ -227,6 +227,39 @@ def place_market_order(
     return data
 
 
+def fetch_open_positions(
+    session: requests.Session,
+    base_url: str,
+    account_id: str,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch all open positions and return a dict keyed by instrument name.
+    Example entry:
+      {
+        "EUR_USD": {
+            "instrument": "EUR_USD",
+            "long": {"units": "1000", ...},
+            "short": {"units": "-1000", ...},
+          },
+        ...
+      }
+    """
+    url = f"{base_url}/accounts/{account_id}/openPositions"
+    resp = session.get(url)
+    resp.raise_for_status()
+    data = resp.json()
+
+    positions_map: Dict[str, Dict[str, Any]] = {}
+    for pos in data.get("positions", []):
+        inst = pos.get("instrument")
+        if not inst:
+            continue
+        positions_map[inst] = pos
+
+    logger.info("Fetched %d open positions", len(positions_map))
+    return positions_map
+
+
 # ------------------------
 # Pip helpers
 # ------------------------
@@ -326,7 +359,7 @@ def compute_ut_trailing_stop(
 
     stop = pd.Series(index=price.index, dtype=float)
 
-    # Initialize stop similar to Pine: price - entryLoss on first valid ATR
+    # Initialize stop مشابه Pine: price - entryLoss on first valid ATR
     entry_loss0 = atr_mult * atr.iloc[first_valid]
     prev_stop = price.iloc[first_valid] - entry_loss0
     stop.iloc[first_valid] = prev_stop
@@ -439,6 +472,8 @@ def run_bot_once():
     - For each instrument:
         * If UT-style SHORT condition is met (sell label + price above H1 SMA240),
           attempt to open a short position sized at 0.1% of marginAvailable.
+        * Only one SHORT position per instrument will be opened; if there is already
+          an open short for that pair, no additional short orders are placed.
     - Log results to a Google Sheets tab.
     """
     session, base_url = get_oanda_session()
@@ -473,6 +508,9 @@ def run_bot_once():
         allocation_percent,
         notional_per_trade,
     )
+
+    # Fetch open positions once so we can enforce "one short per pair"
+    open_positions = fetch_open_positions(session, base_url, account_id)
 
     # First pass: find all candidates with short signals
     candidates: List[Tuple[str, Dict[str, Any]]] = []
@@ -528,67 +566,82 @@ def run_bot_once():
             short_units: Optional[int] = None
             entry_price_used: Optional[float] = None
 
-            try:
-                price_info = price_map.get(pair)
-                if price_info is None:
-                    logger.warning("No pricing info for %s; skipping order.", pair)
-                    order_status = "SKIPPED_NO_PRICE"
-                elif notional_per_trade <= 0:
-                    order_status = "SKIPPED_NO_FUNDS"
-                else:
-                    # For shorts, we assume entry near the *bid*
-                    bid = price_info["bid"]
-                    pip_loc = pip_map.get(pair, -4)
-                    rounded_price = round_price_to_pip(bid, pip_loc)
+            # --- Enforce "only one short per asset" rule ---
+            has_open_short = False
+            pos = open_positions.get(pair)
+            if pos is not None:
+                short_side = pos.get("short", {})
+                units_str = short_side.get("units", "0")
+                try:
+                    has_open_short = float(units_str) < 0
+                except Exception:
+                    has_open_short = False
 
-                    if rounded_price <= 0:
-                        logger.warning(
-                            "Rounded bid price for %s is non-positive (%.8f); skipping.",
-                            pair,
-                            rounded_price,
-                        )
-                        order_status = "SKIPPED_BAD_PRICE"
+            if has_open_short:
+                logger.info("Skipping %s: existing open SHORT position detected.", pair)
+                order_status = "SKIPPED_EXISTING_SHORT"
+            else:
+                try:
+                    price_info = price_map.get(pair)
+                    if price_info is None:
+                        logger.warning("No pricing info for %s; skipping order.", pair)
+                        order_status = "SKIPPED_NO_PRICE"
+                    elif notional_per_trade <= 0:
+                        order_status = "SKIPPED_NO_FUNDS"
                     else:
-                        units_mag = int(round(notional_per_trade / rounded_price))
+                        # For shorts, we assume entry near the *bid*
+                        bid = price_info["bid"]
+                        pip_loc = pip_map.get(pair, -4)
+                        rounded_price = round_price_to_pip(bid, pip_loc)
 
-                        # ---- 1-unit fallback ----
-                        if units_mag <= 0 and notional_per_trade > 0:
-                            logger.info(
-                                "Computed units < 1 for %s (notional=%.4f, price=%.8f); "
-                                "using minimum 1 unit instead.",
-                                pair,
-                                notional_per_trade,
-                                rounded_price,
-                            )
-                            units_mag = 1
-
-                        if units_mag <= 0:
+                        if rounded_price <= 0:
                             logger.warning(
-                                "Computed units <= 0 for %s (notional=%.4f, price=%.8f); skipping",
+                                "Rounded bid price for %s is non-positive (%.8f); skipping.",
                                 pair,
-                                notional_per_trade,
                                 rounded_price,
                             )
-                            order_status = "SKIPPED_ZERO_UNITS"
+                            order_status = "SKIPPED_BAD_PRICE"
                         else:
-                            units = -units_mag  # negative for short
-                            logger.info(
-                                "Placing SHORT market order: pair=%s, units=%d, approx_price=%.8f (pipLocation=%d)",
-                                pair,
-                                units,
-                                rounded_price,
-                                pip_loc,
-                            )
-                            resp = place_market_order(session, base_url, account_id, pair, units)
-                            logger.info("Order response for %s: %s", pair, json.dumps(resp))
+                            units_mag = int(round(notional_per_trade / rounded_price))
 
-                            short_units = units
-                            entry_price_used = rounded_price
-                            order_status = "FILLED"
+                            # ---- 1-unit fallback ----
+                            if units_mag <= 0 and notional_per_trade > 0:
+                                logger.info(
+                                    "Computed units < 1 for %s (notional=%.4f, price=%.8f); "
+                                    "using minimum 1 unit instead.",
+                                    pair,
+                                    notional_per_trade,
+                                    rounded_price,
+                                )
+                                units_mag = 1
 
-            except Exception as exc:
-                logger.exception("Failed to place short order for %s: %s", pair, exc)
-                order_status = "ERROR"
+                            if units_mag <= 0:
+                                logger.warning(
+                                    "Computed units <= 0 for %s (notional=%.4f, price=%.8f); skipping",
+                                    pair,
+                                    notional_per_trade,
+                                    rounded_price,
+                                )
+                                order_status = "SKIPPED_ZERO_UNITS"
+                            else:
+                                units = -units_mag  # negative for short
+                                logger.info(
+                                    "Placing SHORT market order: pair=%s, units=%d, approx_price=%.8f (pipLocation=%d)",
+                                    pair,
+                                    units,
+                                    rounded_price,
+                                    pip_loc,
+                                )
+                                resp = place_market_order(session, base_url, account_id, pair, units)
+                                logger.info("Order response for %s: %s", pair, json.dumps(resp))
+
+                                short_units = units
+                                entry_price_used = rounded_price
+                                order_status = "FILLED"
+
+                except Exception as exc:
+                    logger.exception("Failed to place short order for %s: %s", pair, exc)
+                    order_status = "ERROR"
 
             row = {
                 "pair": pair,
